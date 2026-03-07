@@ -1,0 +1,160 @@
+// ═══════════════════════════════════════════════════════
+//  Grammy — Firestore Security Rules
+//  Covers: privacy settings, per-user blocklists, channels,
+//          DMs, groups, favorites, calls, WebRTC signalling
+// ═══════════════════════════════════════════════════════
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper functions ──────────────────────────────────
+
+    // Is the requesting user authenticated?
+    function isAuthed() {
+      return request.auth != null;
+    }
+
+    // Is the request from the owner of a document?
+    function isOwner(uid) {
+      return request.auth.uid == uid;
+    }
+
+    // Is the requesting user in a chat's participants list?
+    function isParticipant(chatData) {
+      return request.auth.uid in chatData.participants;
+    }
+
+    // Get the requesting user's profile doc (used for privacy checks)
+    function getViewerProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // Is the requesting user blocked from seeing a field?
+    // blockedUsers.{field} is an array of UIDs on the *target* user's doc
+    function isBlockedForField(targetData, field) {
+      return targetData.get('privacy', {}).get('blockedUsers', {}).get(field, []).hasAny([request.auth.uid]);
+    }
+
+    // ── Users collection ──────────────────────────────────
+    match /users/{userId} {
+      // Any authenticated user can read basic profiles
+      // (privacy enforcement is done client-side — rules guard write access)
+      allow read: if isAuthed();
+
+      // Only the owner can write their own profile
+      allow create: if isAuthed() && isOwner(userId);
+      allow update: if isAuthed() && isOwner(userId)
+        // Prevent users from modifying admin-only fields
+        && !request.resource.data.diff(resource.data).affectedKeys()
+             .hasAny(['isBanned']);
+
+      allow delete: if false; // never allow user deletion via client
+    }
+
+    // ── Chats collection (DM / Group / Channel / Favorites / SupportBot) ──
+    match /chats/{chatId} {
+      allow read: if isAuthed()
+        && request.auth.uid in resource.data.participants;
+
+      allow create: if isAuthed()
+        && request.auth.uid in request.resource.data.participants;
+
+      allow update: if isAuthed()
+        && request.auth.uid in resource.data.participants;
+
+      allow delete: if false;
+
+      // ── Messages sub-collection ──
+      match /messages/{msgId} {
+        allow read: if isAuthed()
+          && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+
+        allow create: if isAuthed()
+          && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants
+          && request.resource.data.senderId == request.auth.uid;
+
+        allow update: if isAuthed()
+          // Allow toggling reactions only (partial update)
+          && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions']);
+
+        allow delete: if isAuthed()
+          && resource.data.senderId == request.auth.uid;
+      }
+    }
+
+    // ── Channels collection ──────────────────────────────────
+    match /channels/{channelId} {
+      // Anyone authenticated can read public channel metadata
+      allow read: if isAuthed();
+
+      // Only owner or admin can write channel settings
+      allow create: if isAuthed()
+        && request.resource.data.ownerId == request.auth.uid;
+
+      allow update: if isAuthed()
+        && (resource.data.ownerId == request.auth.uid
+            || request.auth.uid in resource.data.get('admins', []));
+
+      allow delete: if isAuthed()
+        && resource.data.ownerId == request.auth.uid;
+
+      // ── Channel Posts ──
+      match /posts/{postId} {
+        allow read: if isAuthed();
+
+        allow create: if isAuthed()
+          && (get(/databases/$(database)/documents/channels/$(channelId)).data.ownerId == request.auth.uid
+              || request.auth.uid in get(/databases/$(database)/documents/channels/$(channelId)).data.get('admins', []));
+
+        allow update: if isAuthed()
+          // Allow reactions & commentCount updates from any participant
+          && request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['reactions', 'commentCount']);
+
+        allow delete: if isAuthed()
+          && (get(/databases/$(database)/documents/channels/$(channelId)).data.ownerId == request.auth.uid
+              || request.auth.uid in get(/databases/$(database)/documents/channels/$(channelId)).data.get('admins', []));
+
+        // ── Comments ──
+        match /comments/{commentId} {
+          allow read: if isAuthed();
+
+          allow create: if isAuthed()
+            && request.resource.data.senderId == request.auth.uid
+            // Channel must have commentsEnabled = true
+            && get(/databases/$(database)/documents/channels/$(channelId)).data.commentsEnabled == true;
+
+          allow update: if false; // comments are immutable
+
+          allow delete: if isAuthed()
+            && resource.data.senderId == request.auth.uid;
+        }
+      }
+    }
+
+    // ── Calls collection (WebRTC signalling) ──────────────────
+    match /calls/{callId} {
+      allow read: if isAuthed()
+        && (resource.data.callerId == request.auth.uid
+            || resource.data.calleeId == request.auth.uid);
+
+      allow create: if isAuthed()
+        && request.resource.data.callerId == request.auth.uid;
+
+      allow update: if isAuthed()
+        && (resource.data.callerId == request.auth.uid
+            || resource.data.calleeId == request.auth.uid);
+
+      allow delete: if isAuthed()
+        && (resource.data.callerId == request.auth.uid
+            || resource.data.calleeId == request.auth.uid);
+    }
+
+    // ── Deny everything else ──────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
